@@ -386,13 +386,14 @@ def estimate_linear_params(Y, Phi, Q, H, H0):
 
 
 
-def get_estimates(Y, X, T, psi, P, thetas, betas, kappas, A, B, C, noise_std, estimate_cov_sqrt_root, fit_oracle=True, current_batch_size=None, sum_vars=None, prev_feasible_weights=None, verbose=False, prev_H0=None):
+def get_estimates(Y, X, T, psi, P, thetas, betas, kappas, A, B, C, noise_std, estimate_cov_sqrt_root, fit_oracle=True, current_batch_size=None, sum_vars=None, prev_feasible_weights=None, verbose=False, prev_H0=None, estimation_method='gmm'):
     """
     Inputs:
       - Y: [n]
       - X: [n, L, x_dim]
       - T: [n, L, 1]
       - P: [n, L, 1] probability of assigning the treatment
+      - estimation_method: 'gmm'/'z_est'
       
     
     Estimate structure parameters:
@@ -415,17 +416,21 @@ def get_estimates(Y, X, T, psi, P, thetas, betas, kappas, A, B, C, noise_std, es
     
     identity_weights_params = get_identity_weight_matrix(n, L, feature_dim)
     identity_weights_policy_value = np.ones(n)
-    naive_estimate, naive_cov_sqrt_inv = estimate_linear_params(Y, Phi, Q, identity_weights_params, identity_weights_policy_value)
+    if estimation_method == 'z_est':
+        est_func = estimate_linear_params
+    else:
+        est_func = gmm_estimate_linear_params
+    naive_estimate, naive_cov_sqrt_inv = est_func(Y, Phi, Q, identity_weights_params, identity_weights_policy_value)
     
 
     consistent_weights = 1.0 / np.sqrt(Cov_T) * identity_weights_params
-    consistent_estimate, consistent_cov_sqrt_inv = estimate_linear_params(Y, Phi, Q, consistent_weights, identity_weights_policy_value)
+    consistent_estimate, consistent_cov_sqrt_inv = est_func(Y, Phi, Q, consistent_weights, identity_weights_policy_value)
     
     if fit_oracle:
         oracle_r2 = get_residual_second_moment(betas, kappas, X, noise_std)[..., np.newaxis, np.newaxis]
         oracle_w = get_oracle_cov_sqrt_root(X, Phi, A, B, C, noise_std)
         oracle_weights = oracle_w / np.sqrt(Cov_T * oracle_r2)
-        oracle_estimate, oracle_cov_sqrt_inv = estimate_linear_params(Y, Phi, Q, oracle_weights, get_oracle_H0(betas, kappas, noise_std) * np.ones(n))
+        oracle_estimate, oracle_cov_sqrt_inv = est_func(Y, Phi, Q, oracle_weights, get_oracle_H0(betas, kappas, noise_std) * np.ones(n))
     else:
         oracle_estimate, oracle_cov_sqrt_inv = None, None
  
@@ -446,7 +451,7 @@ def get_estimates(Y, X, T, psi, P, thetas, betas, kappas, A, B, C, noise_std, es
         feasible_H0[-current_batch_size:] = 1.0 / np.sqrt(baseline_policy_var)
         
         # Get feasible estimates
-        feasible_estimate, feasible_cov_sqrt_inv = estimate_linear_params(Y, Phi, Q, feasible_weights, feasible_H0)
+        feasible_estimate, feasible_cov_sqrt_inv = est_func(Y, Phi, Q, feasible_weights, feasible_H0)
         return_weights = feasible_weights
         return_H0 = feasible_H0
     else:
@@ -545,3 +550,46 @@ def compute_coverage(theta_hat, cov_hat, true_theta, confidence_level=0.95):
     confidence_intervals = norm.ppf((confidence_level + 1 ) / 2.0) * np.sqrt(np.diag(cov_hat))
     coverages = np.abs(theta_hat - true_theta) <= confidence_intervals
     return coverages, confidence_intervals
+
+
+from scipy.optimize import minimize
+
+# Define the moment condition function
+def moment_conditions(theta, J, Yh):
+    # Example: Linear model moment conditions
+    errors = Yh - J @ theta
+    return errors
+
+# Define the GMM objective function
+def gmm_objective(theta, J, Yh, W):
+    moments = moment_conditions(theta, J, Yh)
+    return moments.T @ W @ moments
+
+# GMM Estimation function
+def gmm_estimation(J, Yh, initial_theta, W=None):
+    if W is None:
+        _, d = J.shape
+        W = np.eye(d)
+    result = minimize(gmm_objective, initial_theta, args=(J, Yh, W), method='BFGS')
+    return result.x, result.fun
+
+def gmm_estimate_linear_params(Y, Phi, Q, H, H0):
+    """
+    Solve theta via weighted empirical Z-estimator.
+    Y: (n)
+    Phi: (n, L, dim_feature)
+    Q: (n, L, dim_feature)
+    H: (n, L, dim_feature, dim_feature)
+    """
+    n, L, dim_feature = Phi.shape
+    J = np.zeros((L * dim_feature + 1, L * dim_feature + 1)) # add policy value
+    Yh = np.zeros(L * dim_feature + 1)
+    for Y_t, Phi_t, Q_t, H_t, H0_t in zip(Y, Phi, Q, H, H0):
+        J = J + get_jacobian_matrix(Phi_t, Q_t, H_t, H0_t)
+        Yh = Yh + get_y_residual(Phi_t, Q_t, Y_t, H_t, H0_t)
+    # theta_hat = np.matmul(np.linalg.inv(J), Yh)
+    initial_theta = np.zeros(L * dim_feature + 1)
+    theta_hat, objective_value = gmm_estimation(J, Yh, initial_theta)
+    # print(f"GMM optimized value is {objective_value}.")
+    cov_sqrt_inv_hat = - J / np.sqrt(n)
+    return theta_hat, cov_sqrt_inv_hat
